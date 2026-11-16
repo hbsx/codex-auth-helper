@@ -1,0 +1,141 @@
+name: Sync upstream release once
+on:
+  push:
+    branches:
+      - codex/sync-upstream-release-v1.0.0
+permissions:
+  contents: write
+concurrency:
+  group: sync-upstream-release-v1.0.0
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Copy upstream tag, release notes, and verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - --sync <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          
+          SOURCE = 'zhishile/codex-auth-helper'
+          TARGET = 'hbsx/codex-auth-helper'
+          API = 'https://api.github.com'
+          
+          TOKEN = os.environ['GH_TOKEN']
+          
+          def request(path, method='GET', data=None, binary=False, content_type=None):
+              url = path if path.startswith('https://') else API + path
+              headers = {'User-Agent': 'codex-release-sync', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+              if url.startswith(API + '/repos/' + TARGET + '/') or url.startswith('https://uploads.github.com/repos/' + TARGET + '/'):
+                  headers['Authorization'] = 'Bearer ' + TOKEN
+              if data is not None:
+                  if not isinstance(data, bytes):
+                      data = json.dumps(data).encode('utf-8')
+                  headers['Content-Type'] = content_type or 'application/json'
+              if binary:
+                  headers['Accept'] = 'application/octet-stream'
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      result = response.read()
+                      return result if binary else json.loads(result)
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode('utf-8', errors='replace')
+                  raise RuntimeError('GitHub HTTP %s for %s: %s' % (error.code, url, detail)) from None
+          
+          def collection(path):
+              items = []
+              page = 1
+              while True:
+                  part = request(path + ('&' if '?' in path else '?') + 'per_page=100&page=' + str(page))
+                  items.extend(part)
+                  if len(part) < 100:
+                      return items
+                  page += 1
+          
+          source_releases = [r for r in collection('/repos/' + SOURCE + '/releases') if not r['draft']]
+          target_releases = collection('/repos/' + TARGET + '/releases')
+          target_by_tag = {r['tag_name']: r for r in target_releases}
+          source_tags = {t['name']: t for t in collection('/repos/' + SOURCE + '/tags')}
+          target_tags = {t['name']: t for t in collection('/repos/' + TARGET + '/tags')}
+          
+          plan = []
+          for release in reversed(source_releases):
+              tag = release['tag_name']
+              if tag not in source_tags:
+                  raise RuntimeError('Source release tag not found: ' + tag)
+              sha = source_tags[tag]['commit']['sha']
+              if tag in target_tags and target_tags[tag]['commit']['sha'] != sha:
+                  raise RuntimeError('Target tag conflicts with upstream: ' + tag)
+              plan.append({'tag': tag, 'commit': sha, 'title': release['name'], 'assets': [{'name': a['name'], 'size': a['size'], 'digest': a.get('digest')} for a in release['assets']], 'already_exists': tag in target_by_tag})
+          print(json.dumps({'plan': plan}, ensure_ascii=False), flush=True)
+          
+          if '--sync' not in sys.argv:
+              sys.exit(0)
+          
+          results = []
+          for release in reversed(source_releases):
+              tag = release['tag_name']
+              sha = source_tags[tag]['commit']['sha']
+              downloads = []
+              for asset in release['assets']:
+                  payload = request(asset['browser_download_url'], binary=True)
+                  digest = 'sha256:' + hashlib.sha256(payload).hexdigest()
+                  if asset.get('digest') and digest != asset['digest']:
+                      raise RuntimeError('Source checksum mismatch: ' + asset['name'])
+                  if len(payload) != asset['size']:
+                      raise RuntimeError('Source size mismatch: ' + asset['name'])
+                  downloads.append((asset, payload, digest))
+              if tag not in target_tags:
+                  ref = request('/repos/' + SOURCE + '/git/ref/tags/' + tag)
+                  obj = ref['object']
+                  request('/repos/' + TARGET + '/git/refs', method='POST', data={'ref': 'refs/tags/' + tag, 'sha': obj['sha']})
+                  print('Synced tag ' + tag, flush=True)
+              existing = target_by_tag.get(tag)
+              fields = {k: release[k] for k in ('tag_name', 'name', 'body', 'prerelease')}
+              fields['target_commitish'] = sha
+              fields['make_latest'] = 'false' if release['prerelease'] else 'legacy'
+              if existing is None:
+                  fields['draft'] = True
+                  existing = request('/repos/' + TARGET + '/releases', method='POST', data=fields)
+                  print('Created draft ' + tag, flush=True)
+              else:
+                  existing = request('/repos/' + TARGET + '/releases/' + str(existing['id']), method='PATCH', data=fields)
+              existing_assets = {a['name']: a for a in existing['assets']}
+              for asset, payload, digest in downloads:
+                  if asset['name'] in existing_assets:
+                      old = existing_assets[asset['name']]
+                      old_digest = old.get('digest') or ('sha256:' + hashlib.sha256(request(old['url'], binary=True)).hexdigest())
+                      if old_digest != digest:
+                          raise RuntimeError('Target asset conflicts; no deletion performed: ' + asset['name'])
+                  else:
+                      from urllib.parse import urlencode
+                      upload_url = existing['upload_url'].split('{')[0] + '?' + urlencode({'name': asset['name'], **({'label': asset['label']} if asset.get('label') else {})})
+                      uploaded = request(upload_url, method='POST', data=payload, content_type=asset['content_type'])
+                      if uploaded.get('digest') and uploaded['digest'] != digest:
+                          raise RuntimeError('Uploaded checksum mismatch: ' + asset['name'])
+                      print('Uploaded and verified ' + asset['name'], flush=True)
+              published = request('/repos/' + TARGET + '/releases/' + str(existing['id']), method='PATCH', data={'draft': False, 'make_latest': fields['make_latest']})
+              verified = request('/repos/' + TARGET + '/releases/' + str(published['id']))
+              if verified['draft'] or any(verified.get(k) != release.get(k) for k in ('tag_name', 'name', 'body', 'prerelease')):
+                  raise RuntimeError('Published release metadata verification failed')
+              verified_assets = {a['name']: a for a in verified['assets']}
+              for asset, payload, digest in downloads:
+                  dest = verified_assets[asset['name']]
+                  if dest['size'] != asset['size'] or 'sha256:' + hashlib.sha256(request(dest['browser_download_url'], binary=True)).hexdigest() != digest:
+                      raise RuntimeError('Published asset verification failed: ' + asset['name'])
+              result = {'tag': tag, 'url': verified['html_url'], 'commit': sha, 'assets': [{'name': a['name'], 'sha256': d} for a, p, d in downloads]}
+              results.append(result)
+              print(json.dumps(result, ensure_ascii=False), flush=True)
+          print('Release synchronization complete.', flush=True)
+          PY
